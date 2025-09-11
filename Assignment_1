@@ -1,0 +1,10 @@
+# Assignment 1  
+
+This folder contains my submission for Assignment 1:  
+- **Notebook**: Logistic Regression (discriminative) vs GAN (generative) on MNIST  
+- **Report**: PDF analysis and reflections  
+
+## How to run
+1. Open the Jupyter notebook (`assignment1_logreg_vs_gan.ipynb`) in Google Colab or locally.  
+2. Run cells top to bottom.  
+3. Outputs (plots, generated samples) will be saved in the `outputs/` folder.  
