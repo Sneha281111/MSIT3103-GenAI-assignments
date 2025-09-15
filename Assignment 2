@@ -1,0 +1,581 @@
+# Install required packages in Google Colab
+!pip install evaluate datasets transformers torch scikit-learn
+
+# Import after installation
+import os
+import torch
+import numpy as np
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
+    Trainer,
+    TrainingArguments,
+    pipeline
+)
+import evaluate
+from transformers import logging
+from sklearn.metrics import f1_score
+import json
+
+# Silence warnings for cleaner output
+logging.set_verbosity_error()
+
+# Use GPU if available (Colab usually provides GPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+# Verify GPU
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+else:
+    print("No GPU available - training will be slower")
+#!pip -q install -U huggingface_hub
+
+import os, getpass
+from huggingface_hub import login, whoami
+
+hf_token = None
+
+# 1) Try Colab Secret (if available)
+try:
+    from google.colab import userdata
+    try:
+        hf_token = userdata.get("HF_TOKEN")  # may raise SecretNotFoundError
+    except Exception:
+        hf_token = None
+except Exception:
+    hf_token = None
+
+# 2) Try environment variable
+if not hf_token:
+    hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+# 3) If still missing, optionally prompt (press Enter to skip)
+if not hf_token:
+    print("No HF token found. Press Enter to skip (public models) or paste your token.")
+    try:
+        hf_token = getpass.getpass("HF token: ").strip()
+    except Exception:
+        hf_token = ""
+
+if hf_token:
+    try:
+        login(token=hf_token)
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        print("Authenticated with Hugging Face")
+        try:
+            print("User:", whoami().get("name", "<unknown>"))
+        except Exception:
+            pass
+    except Exception as e:
+        print(" Login failed:", e, "\nProceeding without auth (public models only).")
+else:
+    print("Proceeding without authentication (public models only).")
+# =============================================================================
+# PART 1: DATASET PREPARATION
+# =============================================================================
+
+print("\n" + "="*60)
+print("PART 1: DATASET PREPARATION - SQuAD v1.1")
+print("="*60)
+
+# Load SQuAD v1.1 dataset
+print("Loading SQuAD v1.1 dataset...")
+squad_dataset = load_dataset("squad")
+
+# For demonstration and faster training, use smaller subsets
+train_size = 1000  # Reduced for faster training
+val_size = 200
+train_dataset = squad_dataset["train"].shuffle(seed=42).select(range(train_size))
+val_dataset = squad_dataset["validation"].shuffle(seed=42).select(range(val_size))
+
+print(f"Dataset splits: {squad_dataset.keys()}")
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"\nExample record:")
+example = train_dataset[0]
+print(f"Context: {example['context'][:200]}...")
+print(f"Question: {example['question']}")
+print(f"Answer: {example['answers']}")
+
+# =============================================================================
+# DECODER-ONLY MODEL: GPT-2 for Generative QA
+# =============================================================================
+
+print("\n" + "="*60)
+print("DECODER-ONLY MODEL: GPT-2 for Generative QA")
+print("="*60)
+
+# Load GPT-2 tokenizer and model
+gpt2_model_name = "gpt2"
+gpt2_tokenizer = AutoTokenizer.from_pretrained(gpt2_model_name)
+gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+
+def preprocess_gpt2_qa(examples):
+    """
+    Preprocess SQuAD data for GPT-2 generative QA
+    Format: "Context: [context] Question: [question] Answer: [answer]"
+    """
+    inputs = []
+    for context, question, answers in zip(examples["context"], examples["question"], examples["answers"]):
+        # Take the first answer for training
+        answer_text = answers["text"][0] if answers["text"] else ""
+
+        # Format: Context: ... Question: ... Answer: ...
+        input_text = f"Context: {context} Question: {question} Answer: {answer_text}"
+        inputs.append(input_text)
+
+    # Tokenize
+    model_inputs = gpt2_tokenizer(
+        inputs,
+        max_length=512,
+        truncation=True,
+        padding="max_length"
+    )
+
+    # For causal LM, labels are the same as input_ids
+    model_inputs["labels"] = model_inputs["input_ids"].copy()
+
+    return model_inputs
+
+print("Preprocessing data for GPT-2...")
+train_gpt2 = train_dataset.map(preprocess_gpt2_qa, batched=True, remove_columns=train_dataset.column_names)
+val_gpt2 = val_dataset.map(preprocess_gpt2_qa, batched=True, remove_columns=val_dataset.column_names)
+
+print("Sample tokenized GPT-2 input:")
+print(gpt2_tokenizer.decode(train_gpt2[0]["input_ids"][:150], skip_special_tokens=True))
+
+# Load GPT-2 model
+gpt2_model = AutoModelForCausalLM.from_pretrained(gpt2_model_name)
+
+# Training arguments for GPT-2
+training_args_gpt2 = TrainingArguments(
+    output_dir="./gpt2-qa",
+    eval_strategy="steps",
+    eval_steps=100,
+    logging_steps=50,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    num_train_epochs=2,
+    weight_decay=0.01,
+    save_steps=500,
+    save_total_limit=1,
+    warmup_steps=50,
+    gradient_accumulation_steps=4,
+    fp16=torch.cuda.is_available(),
+    report_to=[],
+    load_best_model_at_end=True,
+)
+
+# Data collator for causal LM
+data_collator_gpt2 = DataCollatorForLanguageModeling(tokenizer=gpt2_tokenizer, mlm=False)
+
+# Create trainer
+trainer_gpt2 = Trainer(
+    model=gpt2_model,
+    args=training_args_gpt2,
+    train_dataset=train_gpt2,
+    eval_dataset=val_gpt2,
+    data_collator=data_collator_gpt2,
+)
+
+print("Training GPT-2 for QA...")
+trainer_gpt2.train()
+
+# Test GPT-2 generation
+print("\nTesting GPT-2 generation:")
+test_input = "Context: The sky is blue during the day. Question: What color is the sky? Answer:"
+inputs = gpt2_tokenizer(test_input, return_tensors="pt").to(device)
+with torch.no_grad():
+    outputs = gpt2_model.generate(
+        inputs["input_ids"],
+        max_length=inputs["input_ids"].shape[1] + 20,
+        temperature=0.7,
+        pad_token_id=gpt2_tokenizer.eos_token_id
+    )
+generated_text = gpt2_tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Generated: {generated_text}")
+
+# =============================================================================
+# ENCODER-ONLY MODEL: BERT for Extractive QA
+# =============================================================================
+
+print("\n" + "="*60)
+print("ENCODER-ONLY MODEL: BERT for Extractive QA")
+print("="*60)
+
+# Load BERT for Question Answering
+bert_model_name = "bert-base-uncased"
+bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+
+def preprocess_bert_qa(examples):
+    """
+    Preprocess SQuAD data for BERT extractive QA
+    """
+    questions = [q.strip() for q in examples["question"]]
+    contexts = examples["context"]
+
+    # Tokenize questions and contexts together
+    inputs = bert_tokenizer(
+        questions,
+        contexts,
+        max_length=512,
+        truncation="only_second",  # Truncate context if needed
+        padding="max_length",
+        return_overflowing_tokens=False,
+        return_offsets_mapping=True,
+        stride=128,
+    )
+
+    # Find start and end positions for answers
+    offset_mapping = inputs.pop("offset_mapping")
+    start_positions = []
+    end_positions = []
+
+    for i, (answer, offset) in enumerate(zip(examples["answers"], offset_mapping)):
+        if answer["answer_start"]:
+            start_char = answer["answer_start"][0]
+            end_char = start_char + len(answer["text"][0])
+
+            # Find token start and end positions
+            token_start = None
+            token_end = None
+
+            for idx, (start_offset, end_offset) in enumerate(offset):
+                if start_offset <= start_char < end_offset and token_start is None:
+                    token_start = idx
+                if start_offset < end_char <= end_offset and token_end is None:
+                    token_end = idx
+                    break
+
+            if token_start is None:
+                token_start = 0
+            if token_end is None:
+                token_end = 0
+
+            start_positions.append(token_start)
+            end_positions.append(token_end)
+        else:
+            start_positions.append(0)
+            end_positions.append(0)
+
+    inputs["start_positions"] = start_positions
+    inputs["end_positions"] = end_positions
+
+    return inputs
+
+print("Preprocessing data for BERT...")
+train_bert = train_dataset.map(preprocess_bert_qa, batched=True, remove_columns=train_dataset.column_names)
+val_bert = val_dataset.map(preprocess_bert_qa, batched=True, remove_columns=val_dataset.column_names)
+
+# Load BERT QA model
+bert_model = AutoModelForQuestionAnswering.from_pretrained(bert_model_name)
+
+# Training arguments for BERT
+training_args_bert = TrainingArguments(
+    output_dir="./bert-qa",
+    eval_strategy="steps",
+    eval_steps=100,
+    logging_steps=50,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    save_steps=500,
+    save_total_limit=1,
+    warmup_steps=100,
+    fp16=torch.cuda.is_available(),
+    report_to=[],
+    load_best_model_at_end=True,
+)
+
+# Create trainer for BERT
+trainer_bert = Trainer(
+    model=bert_model,
+    args=training_args_bert,
+    train_dataset=train_bert,
+    eval_dataset=val_bert,
+    tokenizer=bert_tokenizer,
+)
+
+print("Training BERT for QA...")
+trainer_bert.train()
+
+# Test BERT QA
+print("\nTesting BERT QA:")
+qa_pipeline = pipeline("question-answering", model=bert_model, tokenizer=bert_tokenizer)
+test_context = "The sky is blue during the day because of the way sunlight interacts with the atmosphere."
+test_question = "What color is the sky?"
+result = qa_pipeline(question=test_question, context=test_context)
+print(f"Question: {test_question}")
+print(f"Answer: {result['answer']} (confidence: {result['score']:.3f})")
+
+# =============================================================================
+# ENCODER-DECODER MODEL: T5 for Generative QA
+# =============================================================================
+
+print("\n" + "="*60)
+print("ENCODER-DECODER MODEL: T5 for Generative QA")
+print("="*60)
+
+# Load T5 tokenizer and model
+t5_model_name = "t5-small"
+t5_tokenizer = AutoTokenizer.from_pretrained(t5_model_name)
+
+def preprocess_t5_qa(examples):
+    """
+    Preprocess SQuAD data for T5 generative QA
+    Format: "question: [question] context: [context]"
+    """
+    inputs = []
+    targets = []
+
+    for context, question, answers in zip(examples["context"], examples["question"], examples["answers"]):
+        # Input format for T5
+        input_text = f"question: {question} context: {context}"
+        inputs.append(input_text)
+
+        # Target is the answer
+        answer_text = answers["text"][0] if answers["text"] else ""
+        targets.append(answer_text)
+
+    # Tokenize inputs
+    model_inputs = t5_tokenizer(
+        inputs,
+        max_length=512,
+        truncation=True,
+        padding="max_length"
+    )
+
+    # Tokenize targets
+    labels = t5_tokenizer(
+        targets,
+        max_length=128,
+        truncation=True,
+        padding="max_length"
+    )
+
+    model_inputs["labels"] = labels["input_ids"]
+
+    return model_inputs
+
+print("Preprocessing data for T5...")
+train_t5 = train_dataset.map(preprocess_t5_qa, batched=True, remove_columns=train_dataset.column_names)
+val_t5 = val_dataset.map(preprocess_t5_qa, batched=True, remove_columns=val_dataset.column_names)
+
+print("Sample T5 input:")
+sample_input = t5_tokenizer.decode(train_t5[0]["input_ids"][:100], skip_special_tokens=True)
+sample_target = t5_tokenizer.decode(train_t5[0]["labels"][:50], skip_special_tokens=True)
+print(f"Input: {sample_input}")
+print(f"Target: {sample_target}")
+
+# Load T5 model
+t5_model = AutoModelForSeq2SeqLM.from_pretrained(t5_model_name)
+
+# Data collator for seq2seq
+data_collator_t5 = DataCollatorForSeq2Seq(tokenizer=t5_tokenizer, model=t5_model)
+
+# Training arguments for T5
+training_args_t5 = TrainingArguments(
+    output_dir="./t5-qa",
+    eval_strategy="steps",
+    eval_steps=100,
+    logging_steps=50,
+    per_device_train_batch_size=2,
+    per_device_eval_batch_size=2,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    save_steps=500,
+    save_total_limit=1,
+    warmup_steps=100,
+    gradient_accumulation_steps=4,
+    fp16=torch.cuda.is_available(),
+    report_to=[],
+    load_best_model_at_end=True,
+)
+
+# Create trainer for T5
+trainer_t5 = Trainer(
+    model=t5_model,
+    args=training_args_t5,
+    train_dataset=train_t5,
+    eval_dataset=val_t5,
+    data_collator=data_collator_t5,
+    tokenizer=t5_tokenizer,
+)
+
+print("Training T5 for QA...")
+trainer_t5.train()
+
+# Test T5 generation
+print("\nTesting T5 QA:")
+test_input = "question: What color is the sky? context: The sky is blue during the day."
+inputs = t5_tokenizer(test_input, return_tensors="pt").to(device)
+with torch.no_grad():
+    outputs = t5_model.generate(**inputs, max_length=50)
+generated_answer = t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(f"Input: {test_input}")
+print(f"Generated Answer: {generated_answer}")
+# Clear memory before evaluation
+import gc
+torch.cuda.empty_cache()
+gc.collect()
+print(f"Memory cleared. GPU usage: {torch.cuda.memory_allocated(0)/1024**3:.2f} GB")
+# Fix for evaluate library issue - add this cell before running Part 2
+EVALUATE_AVAILABLE = False
+print("Using manual metric implementations (bypassing evaluate library)")
+
+# Also define the manual functions if not already defined
+import string
+import re
+from collections import Counter
+import numpy as np
+
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def f1_score_squad(prediction, ground_truth):
+    """Compute F1 score between prediction and ground truth."""
+    prediction_tokens = normalize_answer(prediction).split()
+    ground_truth_tokens = normalize_answer(ground_truth).split()
+
+    if len(prediction_tokens) == 0 or len(ground_truth_tokens) == 0:
+        return int(prediction_tokens == ground_truth_tokens)
+
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+
+    if num_same == 0:
+        return 0
+
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    f1 = (2 * precision * recall) / (precision + recall)
+
+    return f1
+
+def exact_match_score(prediction, ground_truth):
+    """Compute exact match score."""
+    return normalize_answer(prediction) == normalize_answer(ground_truth)
+
+def compute_squad_metrics(predictions, references):
+    """Compute SQuAD metrics manually."""
+    f1_scores = []
+    em_scores = []
+
+    for pred, ref in zip(predictions, references):
+        pred_text = pred["prediction_text"]
+        ref_answers = ref["answers"]["text"]
+
+        # Take the best score among all reference answers
+        max_f1 = max([f1_score_squad(pred_text, ans) for ans in ref_answers])
+        max_em = max([exact_match_score(pred_text, ans) for ans in ref_answers])
+
+        f1_scores.append(max_f1)
+        em_scores.append(max_em)
+
+    return {
+        "exact_match": np.mean(em_scores) * 100,
+        "f1": np.mean(f1_scores) * 100
+    }
+
+def compute_bleu_score(predictions, references):
+    """Compute BLEU score manually (simplified version)."""
+    total_bleu = 0
+    count = 0
+
+    for pred, ref_list in zip(predictions, references):
+        pred_tokens = pred.split()
+
+        # Handle reference format
+        if isinstance(ref_list[0], list):
+            ref_tokens = ref_list[0][0].split()  # Take first reference
+        else:
+            ref_tokens = ref_list[0].split()
+
+        if len(pred_tokens) == 0 or len(ref_tokens) == 0:
+            continue
+
+        # Simple unigram BLEU for robustness
+        pred_set = set(pred_tokens)
+        ref_set = set(ref_tokens)
+
+        if len(pred_set) > 0:
+            overlap = len(pred_set & ref_set)
+            bleu = overlap / len(pred_set)
+        else:
+            bleu = 0.0
+
+        total_bleu += bleu
+        count += 1
+
+    return total_bleu / count if count > 0 else 0.0
+
+print(" Manual metrics loaded successfully!")
+# --- Recovery cell: reload models/tokenizers for evaluation ---
+import os, torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoModelForQuestionAnswering,
+    AutoModelForSeq2SeqLM,
+)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def load_or_fallback(model_dir, base_name, cls):
+    if os.path.isdir(model_dir):
+        try:
+            print(f"Loading {cls.__name__} from {model_dir} ...")
+            return cls.from_pretrained(model_dir)
+        except Exception as e:
+            print(f"⚠️ Could not load from {model_dir}: {e}. Falling back to {base_name}.")
+    print(f"Loading {cls.__name__} from hub: {base_name} ...")
+    return cls.from_pretrained(base_name)
+
+# Tokenizers (prefer checkpoint dirs so special tokens/configs match)
+if "gpt2_tokenizer" not in globals():
+    gpt2_tokenizer = AutoTokenizer.from_pretrained("./gpt2-qa" if os.path.isdir("./gpt2-qa") else "gpt2")
+    if gpt2_tokenizer.pad_token is None:
+        gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+
+if "bert_tokenizer" not in globals():
+    bert_tokenizer = AutoTokenizer.from_pretrained("./bert-qa" if os.path.isdir("./bert-qa") else "bert-base-uncased")
+
+if "t5_tokenizer" not in globals():
+    t5_tokenizer = AutoTokenizer.from_pretrained("./t5-qa" if os.path.isdir("./t5-qa") else "t5-small")
+
+# Models (prefer your fine-tuned checkpoints)
+if "gpt2_model" not in globals():
+    gpt2_model = load_or_fallback("./gpt2-qa", "gpt2", AutoModelForCausalLM).to(device)
+
+if "bert_model" not in globals():
+    bert_model = load_or_fallback("./bert-qa", "bert-base-uncased", AutoModelForQuestionAnswering).to(device)
+
+if "t5_model" not in globals():
+    t5_model = load_or_fallback("./t5-qa", "t5-small", AutoModelForSeq2SeqLM).to(device)
+
+print("Models ready:",
+      type(gpt2_model).__name__, "|",
+      type(bert_model).__name__, "|",
+      type(t5_model).__name__)
+
